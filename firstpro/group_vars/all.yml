@@ -91,4 +91,12 @@ dns_mappings:
     machine_name: "{{ machines_info[2].name }}"  # master03
   - subdomain: "docker-repo-test"
     machine_name: "{{ machines_info[2].name }}"  # master03
+dns_portainer_mapping:
+  - subdomain: "portainer1-test"
+    machine_name: "{{ machines_info[0].name }}"  # master01
+  - subdomain: "portainer2-test"
+    machine_name: "{{ machines_info[1].name }}"  # master02
+  - subdomain: "portainer3-test"
+    machine_name: "{{ machines_info[2].name }}"  # master03
+
 

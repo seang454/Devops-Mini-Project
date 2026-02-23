@@ -132,4 +132,7 @@
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "portainer_data:/data"
+    command: >
+      --admin-password='{{ portainer_admin_password | password_hash("bcrypt") }}'
+
   become: true
