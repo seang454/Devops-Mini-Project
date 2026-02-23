@@ -1,0 +1,24 @@
+server {
+    listen 80;
+    server_name {{ nexus_domain }};
+
+    access_log /var/log/nginx/nexus_access.log;
+    error_log  /var/log/nginx/nexus_error.log;
+
+    root /var/www/html;
+    location /.well-known/acme-challenge/ {
+        try_files $uri =404;
+    }
+
+    location / {
+        proxy_pass         http://127.0.0.1:{{ nexus_port }};
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        client_max_body_size 2048m;
+        proxy_read_timeout   300s;
+        proxy_send_timeout   300s;
+    }
+}

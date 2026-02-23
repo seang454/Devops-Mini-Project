@@ -1,0 +1,34 @@
+---
+# ============================================================
+# Machine01 Variables — Jenkins Host
+# ============================================================
+
+# Subdomains for services on this machine
+mode: "master01"
+jenkins_domain: >-
+  {{
+    (dns_mappings
+     | selectattr('machine_name', 'equalto', mode)
+     | list
+     | first).subdomain
+  }}.{{ base_domain }}
+
+# Jenkins Docker image version
+jenkins_image_version: "2.541.1-1"
+jenkins_image_name: "myjenkins-blueocean"
+
+# Jenkins Docker volumes
+jenkins_data_volume: "jenkins-data"
+jenkins_certs_volume: "jenkins-docker-certs"
+jenkins_network: "jenkins"
+
+# Jenkins ports
+jenkins_http_port: 8080
+jenkins_agent_port: 50000
+jenkins_dind_port: 2376
+
+# glab (GitLab CLI) version
+glab_version: "1.46.1"
+
+# Ansible version to install via pip
+ansible_pip_version: "latest"

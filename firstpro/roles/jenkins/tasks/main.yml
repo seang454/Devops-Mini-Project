@@ -1,0 +1,209 @@
+---
+# ============================================================
+# Role: jenkins
+# Purpose: Install glab, Ansible, Nginx, Certbot on Machine01
+#          Build custom Jenkins image and run it with DinD
+# ============================================================
+
+# ---- glab (GitLab CLI) ----
+# ---- glab (GitLab CLI) ----
+- name: Get latest glab version
+  ansible.builtin.uri:
+    url: "https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/releases?per_page=1"
+    return_content: true
+  register: glab_release_info
+
+- name: Set glab version fact
+  ansible.builtin.set_fact:
+    glab_version: "{{ (glab_release_info.json | first).tag_name | regex_replace('^v', '') }}"
+
+- name: Download glab binary
+  ansible.builtin.get_url:
+    # New URL format — generic package registry, lowercase linux_amd64
+    url: "https://gitlab.com/api/v4/projects/gitlab-org%2Fcli/packages/generic/glab/{{ glab_version }}/glab_{{ glab_version }}_linux_amd64.tar.gz"
+    dest: "/tmp/glab.tar.gz"
+    mode: "0644"
+
+- name: Create glab extract directory   # ← add this
+  ansible.builtin.file:
+    path: /tmp/glab_extract
+    state: directory
+    mode: "0755"
+
+- name: Extract glab
+  ansible.builtin.unarchive:
+    src: "/tmp/glab.tar.gz"
+    dest: "/tmp/glab_extract/"
+    remote_src: true
+    creates: "/tmp/glab_extract/bin/glab"
+
+- name: Install glab to /usr/local/bin
+  ansible.builtin.copy:
+    src: "/tmp/glab_extract/bin/glab"
+    dest: "/usr/local/bin/glab"
+    mode: "0755"
+    remote_src: true
+  become: true
+
+- name: Verify glab installation
+  ansible.builtin.command: glab --version
+  register: glab_version_output
+  changed_when: false
+
+- name: Show glab version
+  ansible.builtin.debug:
+    msg: "{{ glab_version_output.stdout }}"
+
+# ---- Ansible (install via pip on machine) ----
+- name: Install Ansible via pip3
+  ansible.builtin.pip:
+    name: ansible
+    state: "{{ (ansible_pip_version == 'latest') | ternary('latest', 'present') }}"
+    version: "{{ (ansible_pip_version != 'latest') | ternary(ansible_pip_version, omit) }}"
+    executable: pip3
+  become: true
+
+# ---- Nginx & Certbot ----
+- name: Install Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+  become: true
+
+- name: Install Certbot and Nginx plugin
+  ansible.builtin.apt:
+    name:
+      - certbot
+      - python3-certbot-nginx
+    state: present
+  become: true
+
+- name: Ensure Nginx is started and enabled
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true
+  become: true
+
+# ---- Jenkins Nginx Virtual Host ----
+- name: Deploy Nginx config for Jenkins (HTTP, pre-certbot)
+  ansible.builtin.template:
+    src: jenkins_nginx.conf.j2
+    dest: "/etc/nginx/sites-available/jenkins"
+    mode: "0644"
+  become: true
+  notify: Reload Nginx
+
+- name: Enable Jenkins Nginx site
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/jenkins"
+    dest: "/etc/nginx/sites-enabled/jenkins"
+    state: link
+  become: true
+  notify: Reload Nginx
+
+- name: Remove default Nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  become: true
+  notify: Reload Nginx
+
+- name: Check if SSL certificate already exists for Jenkins
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ jenkins_domain }}/fullchain.pem"
+  register: cert_status
+
+# ---- Certbot SSL for Jenkins ----
+- name: Obtain Let's Encrypt certificate for Jenkins
+  ansible.builtin.command:
+    cmd: >
+      certbot --nginx
+      -d {{ jenkins_domain }}
+      --non-interactive
+      --agree-tos
+      --email {{ certbot_email }}
+      --redirect
+  become: true
+  register: certbot_result
+  changed_when: "'Certificate not yet due for renewal' not in certbot_result.stdout"
+  failed_when:
+    - certbot_result.rc != 0
+    - "'Certificate not yet due for renewal' not in certbot_result.stdout"
+  when: not cert_status.stat.exists
+
+# ---- Docker network for Jenkins ----
+- name: Create Jenkins Docker network
+  community.docker.docker_network:
+    name: "{{ jenkins_network }}"
+    state: present
+  become: true
+
+# ---- Jenkins Dockerfile ----
+- name: Create Jenkins build directory
+  ansible.builtin.file:
+    path: /opt/jenkins-docker
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Deploy Jenkins Dockerfile
+  ansible.builtin.template:
+    src: Dockerfile.j2
+    dest: /opt/jenkins-docker/Dockerfile
+    mode: "0644"
+  become: true
+
+- name: Build custom Jenkins image
+  community.docker.docker_image:
+    name: "{{ jenkins_image_name }}"
+    tag: "{{ jenkins_image_version }}"
+    build:
+      path: /opt/jenkins-docker
+      pull: true
+    source: build
+    force_source: false
+  become: true
+
+# ---- Docker-in-Docker (DinD) container ----
+- name: Run Jenkins Docker-in-Docker (DinD) container
+  community.docker.docker_container:
+    name: jenkins-docker
+    image: docker:dind
+    state: started
+    restart_policy: unless-stopped
+    privileged: true
+    networks:
+      - name: "{{ jenkins_network }}"
+        aliases:
+          - docker
+    env:
+      DOCKER_TLS_CERTDIR: /certs
+    volumes:
+      - "{{ jenkins_certs_volume }}:/certs/client"
+      - "{{ jenkins_data_volume }}:/var/jenkins_home"
+    ports:
+      - "{{ jenkins_dind_port }}:2376"
+    command: "--storage-driver overlay2"
+  become: true
+
+# ---- Jenkins container ----
+- name: Run Jenkins BlueOcean container
+  community.docker.docker_container:
+    name: "{{ jenkins_container_name }}"
+    image: "{{ jenkins_image_name }}:{{ jenkins_image_version }}"
+    state: started
+    restart_policy: on-failure
+    networks:
+      - name: "{{ jenkins_network }}"
+    env:
+      DOCKER_HOST: "tcp://docker:2376"
+      DOCKER_CERT_PATH: /certs/client
+      DOCKER_TLS_VERIFY: "1"
+    volumes:
+      - "{{ jenkins_data_volume }}:/var/jenkins_home"
+      - "{{ jenkins_certs_volume }}:/certs/client:ro"
+    ports:
+      - "{{ jenkins_http_port }}:8080"
+      - "{{ jenkins_agent_port }}:50000"
+  become: true

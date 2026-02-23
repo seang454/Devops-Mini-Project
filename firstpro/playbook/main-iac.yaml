@@ -1,0 +1,169 @@
+---
+# =============================================================
+# main-iac.yaml — Entry point playbook
+# =============================================================
+
+# ── PLAY 1: localhost only — create infra ─────────────────
+- name: Create infrastructure and VMs
+  hosts: localhost
+  become: false
+  gather_facts: true
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/secrets.yml
+  # vars:
+  #   dns_mappings:
+  #     - subdomain: "jenkins-new"
+  #       machine_name: "master01"
+  #     - subdomain: "sonarqube-new"
+  #       machine_name: "master02"
+  #     - subdomain: "nexus-new"
+  #       machine_name: "master03"
+  #     - subdomain: "docker-repo-new"
+  #       machine_name: "master03"
+
+  tasks:
+    - name: Display setup overview and flow
+      import_tasks: ./tasks/flow-display.yaml
+      
+    - name: Run setup-gcloud-env task
+      import_tasks: ./tasks/setup-env.yaml
+
+    - name: Check if service account key file exists
+      ansible.builtin.stat:
+        path: "{{ credential_folder }}/{{ sa_name }}-key.json"
+      register: cred_status
+
+    - name: Run service-account role
+      import_role:
+        name: service-account
+      when: not cred_status.stat.exists
+
+    - name: Wait 5 seconds to ensure service account key is written
+      ansible.builtin.pause:
+        seconds: 5
+      when: not cred_status.stat.exists
+
+    - name: Fix service account key file permissions
+      ansible.builtin.file:
+        path: "{{ credential_folder }}/{{ sa_name }}-key.json"
+        owner: "{{ ansible_facts['user_id'] }}"
+        mode: "0600"
+      become: true
+
+    - name: Run create-masters-task
+      import_tasks: ./tasks/create-masters-task.yaml
+
+    - name: Wait 60 seconds for machines to come up
+      ansible.builtin.pause:
+        seconds: 60
+
+    # ── Fetch real IPs using service account key for auth ──
+    - name: Get external IP for each machine
+      ansible.builtin.command:
+        cmd: >
+          gcloud compute instances describe {{ item.name }}
+          --zone={{ item.zone }}
+          --project={{ gcp_project }}
+          --format=get(networkInterfaces[0].accessConfigs[0].natIP)
+      environment:
+        CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "{{ credential_folder }}/{{ sa_name }}-key.json"
+      loop: "{{ machines_info }}"
+      register: machine_ips
+      changed_when: false
+
+    - name: Debug — show fetched IPs
+      ansible.builtin.debug:
+        msg: "{{ item.item.name }} IP: {{ item.stdout }}"
+      loop: "{{ machine_ips.results }}"
+
+    # - name: Remove stale SSH known_hosts entries by real IP
+    #   ansible.builtin.command:
+    #     cmd: "ssh-keygen -f '/home/{{ agent_user }}/.ssh/known_hosts' -R '{{ item.stdout }}'"
+    #   loop: "{{ machine_ips.results }}"
+    #   when: item.stdout != ""
+    #   ignore_errors: true
+    #   changed_when: false
+    #   become: true
+
+# ── PLAY 1.5: verify all remote hosts are reachable ────────
+- name: Verify all remote machines are reachable before setup
+  hosts: jenkins_hosts:sonarqube_hosts:nexus_hosts
+  become: false
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/secrets.yml
+
+  tasks:
+    - name: Refresh inventory to pick up new IPs  # ← did you add this?
+      ansible.builtin.meta: refresh_inventory
+    - name: Wait for SSH to become available
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 300
+        state: started
+
+    - name: Verify SSH connection with ping
+      ansible.builtin.ping:
+      register: ping_result
+      ignore_unreachable: true
+      ignore_errors: true
+
+    - name: Fail if host is not reachable
+      ansible.builtin.fail:
+        msg: "❌ '{{ inventory_hostname }}' ({{ ansible_host }}) is NOT reachable — aborting!"
+      when: ping_result is unreachable or ping_result is failed
+
+    - name: Confirm host is reachable
+      ansible.builtin.debug:
+        msg: "✅ '{{ inventory_hostname }}' ({{ ansible_host }}) is reachable and ready."
+
+# ── PLAY 2: remote hosts — install all services ────────────
+- name: Setup all remote machines
+  hosts: jenkins_hosts:sonarqube_hosts:nexus_hosts
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/secrets.yml
+
+  tasks:
+    - name: Gather facts
+      ansible.builtin.gather_facts:
+
+    - name: Run common role
+      import_role:
+        name: common
+
+    - name: Run Setup Machine01 — Jenkins
+      import_role:
+        name: jenkins
+      when: inventory_hostname in groups['jenkins_hosts']
+
+    - name: Run Setup Machine02 — SonarQube
+      import_role:
+        name: sonarqube
+      when: inventory_hostname in groups['sonarqube_hosts']
+
+    - name: Run Setup Machine03 — Nexus Repository
+      import_role:
+        name: nexus
+      when: inventory_hostname in groups['nexus_hosts']
+
+# ── PLAY 3: localhost only — wait for services + get creds ─
+- name: Wait for all services and retrieve credentials
+  hosts: localhost
+  become: false
+  gather_facts: true
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/secrets.yml
+  vars:
+    health_check_retries: 40
+    health_check_delay: 15
+
+  tasks:
+    - name: Run gap-password task
+      import_tasks: ./tasks/gap-password.yaml

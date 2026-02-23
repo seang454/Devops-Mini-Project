@@ -1,0 +1,27 @@
+# =============================================================
+# inventory.ini — Auto-generated after destroy
+# Re-run main-iac.yaml to populate with new machine IPs
+# =============================================================
+
+[all:vars]
+ansible_user={{ agent_user }}
+ansible_ssh_private_key_file=/home/{{ agent_user }}/.ssh/id_rsa
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_extra_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+[local]
+localhost ansible_connection=local
+
+[masters]
+{% for machine in surviving_machines %}
+{{ machine.name }} ansible_host={{ machine.ip }}
+{% endfor %}
+
+[jenkins_hosts]
+master01
+
+[sonarqube_hosts]
+master02
+
+[nexus_hosts]
+master03

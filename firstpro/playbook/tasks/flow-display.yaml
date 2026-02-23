@@ -1,0 +1,193 @@
+# ── HEADER ────────────────────────────────────────────────
+- name: Print header
+  ansible.builtin.debug:
+    msg:
+      - "╔══════════════════════════════════════════════════════╗"
+      - "║         INFRASTRUCTURE DEPLOYMENT PLAN               ║"
+      - "║         ansible-infra / GCP Edition                  ║"
+      - "╚══════════════════════════════════════════════════════╝"
+
+- name: Pause to read header
+  ansible.builtin.pause:
+    seconds: 1
+
+# ── SECTION 1: IDENTITY ───────────────────────────────────
+- name: Print identity and environment
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  [ IDENTITY & ENVIRONMENT ]"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  Agent user       : {{ agent_user }}"
+      - "  Control node     : {{ ansible_hostname }}"
+      - "  Python venv      : {{ venv_path }}"
+      - "  SSH public key   : {{ ssh_pubkey_path }}"
+      - "  Credential folder: {{ credential_folder }}"
+
+# ── SECTION 2: GCP PROJECT ───────────────────────────────
+- name: Print GCP project info
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  [ GCP PROJECT ]"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  Project ID       : {{ gcp_project }}"
+      - "  Auth kind        : {{ gcp_auth_kind }}"
+      - "  Service account  : {{ sa_name }}"
+      - "  SA key path      : {{ credential_folder }}/{{ sa_name }}-key.json"
+      - "  SA display name  : {{ sa_display_name }}"
+
+# ── SECTION 3: MACHINES TO CREATE ────────────────────────
+# NOTE: Jinja2 has no ljust filter — pre-build rows with set_fact
+- name: Build machine display rows
+  ansible.builtin.set_fact:
+    machine_rows: >-
+      {{
+        machine_rows | default([]) + [
+          '  ' ~ (loop_idx + 1) | string
+          ~ '  ' ~ item.name
+          ~ ' | ' ~ item.machine_type
+          ~ ' | ' ~ item.zone
+          ~ ' | ' ~ item.disk_size | string ~ 'GB'
+          ~ ' | Ubuntu 22.04'
+        ]
+      }}
+  loop: "{{ machines_info }}"
+  loop_control:
+    index_var: loop_idx
+
+- name: Print machines to create
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        [
+          '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+          '  [ MACHINES TO CREATE ]  (' ~ (machines_info | length) ~ ' total)',
+          '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+          '  #  Name     | Type           | Zone           | Disk | OS',
+          '  ───────────────────────────────────────────────────────'
+        ] + machine_rows
+      }}
+
+# ── SECTION 4: SERVICES PER MACHINE ──────────────────────
+- name: Print services per machine
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  [ SERVICES PER MACHINE ]"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  master01 (jenkins_hosts)"
+      - "    ├─ common  → Docker, Oh My Zsh, Portainer"
+      - "    └─ jenkins → Jenkins BlueOcean ({{ jenkins_container_name }}) + DinD + glab + Ansible"
+      - ""
+      - "  master02 (sonarqube_hosts)"
+      - "    ├─ common    → Docker, Oh My Zsh, Portainer"
+      - "    └─ sonarqube → SonarQube + PostgreSQL"
+      - ""
+      - "  master03 (nexus_hosts)"
+      - "    ├─ common → Docker, Oh My Zsh, Portainer"
+      - "    └─ nexus  → Nexus Repository (Docker + Helm registries)"
+      - ""
+      - "  ALL machines"
+      - "    └─ Nginx + Certbot (Let's Encrypt HTTPS)"
+
+# ── SECTION 5: DNS MAPPINGS ──────────────────────────────
+# NOTE: Build DNS rows with set_fact to avoid ljust
+- name: Build DNS display rows
+  ansible.builtin.set_fact:
+    dns_rows: >-
+      {{
+        dns_rows | default([]) + [
+          '  ' ~ item.subdomain ~ '.' ~ base_domain
+          ~ '  →  ' ~ item.machine_name
+        ]
+      }}
+  loop: "{{ dns_mappings }}"
+
+- name: Print DNS mappings
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        [
+          '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+          '  [ DNS MAPPINGS — CLOUDFLARE ]',
+          '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+          '  Subdomain  →  Machine'
+        ] + dns_rows
+      }}
+
+# ── SECTION 6: HTTPS ENDPOINTS ───────────────────────────
+- name: Print HTTPS endpoints after setup
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  [ HTTPS ENDPOINTS AFTER SETUP ]"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  Jenkins         → https://{{ dns_mappings[0].subdomain }}.{{ base_domain }}"
+      - "  SonarQube       → https://{{ dns_mappings[1].subdomain }}.{{ base_domain }}"
+      - "  Nexus           → https://{{ dns_mappings[2].subdomain }}.{{ base_domain }}"
+      - "  Docker registry → https://{{ dns_mappings[3].subdomain }}.{{ base_domain }}"
+      - "  Portainer       → https://<machine-ip>:9443  (all machines)"
+      - "  Let's Encrypt   → {{ certbot_email }}"
+
+# ── SECTION 7: PLAY SEQUENCE ─────────────────────────────
+- name: Print playbook execution sequence
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  [ PLAYBOOK EXECUTION SEQUENCE ]"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  PLAY 1   localhost     Bootstrap & Provision"
+      - "    ├─ Setup gcloud env + venv"
+      - "    ├─ Create GCP service account (if key missing)"
+      - "    ├─ Create {{ machines_info | length }} GCP VMs"
+      - "    ├─ Wait 60s for VMs to boot"
+      - "    └─ Fetch external IPs via gcloud CLI"
+      - ""
+      - "  PLAY 1.5 remote hosts  Connectivity Check"
+      - "    ├─ Refresh inventory"
+      - "    ├─ Wait for SSH port 22 (timeout 300s)"
+      - "    └─ Ping all hosts — abort if any unreachable"
+      - ""
+      - "  PLAY 2   remote hosts  Install Services"
+      - "    ├─ Gather facts"
+      - "    ├─ common role     → all hosts"
+      - "    ├─ jenkins role    → master01"
+      - "    ├─ sonarqube role  → master02"
+      - "    └─ nexus role      → master03"
+      - ""
+      - "  PLAY 3   localhost     Health Check & Credentials"
+      - "    ├─ Health-check all services (40 retries × 15s)"
+      - "    └─ Print initial passwords"
+
+# ── SECTION 8: ESTIMATED RUNTIME ─────────────────────────
+- name: Print estimated runtime
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  [ ESTIMATED RUNTIME ]"
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  VM provisioning    ~2-3  min"
+      - "  VM boot wait       ~1    min  (fixed)"
+      - "  SSH wait           ~1-2  min"
+      - "  Service installs   ~10-15 min (all machines in parallel)"
+      - "  Health checks      ~10   min  (40 retries × 15s)"
+      - "  ─────────────────────────────────────────────────────"
+      - "  Total (estimate)   ~25-35 min"
+
+# ── CONFIRM OR ABORT ─────────────────────────────────────
+- name: Print confirmation prompt
+  ansible.builtin.debug:
+    msg:
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - "  Review the plan above."
+      - "  Press ENTER to proceed  |  Ctrl+C then A to abort."
+      - "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+- name: Waiting for confirmation
+  ansible.builtin.pause:
+    prompt: ""
+
+- name: Confirmed — starting deployment
+  ansible.builtin.debug:
+    msg: "🚀 Plan accepted — handing off to main-iac.yaml"

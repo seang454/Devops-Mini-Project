@@ -1,0 +1,170 @@
+# tasks for only create the master instance 
+- name: Loop to show machines specs
+  debug: 
+    msg: |
+      Machine Name: {{ item.name }}
+
+  loop: "{{ machines_info }}"
+  when: true 
+- name: Check if public key exist 
+  stat:
+    path: "{{ ssh_pubkey_path }}"
+  register: ssh_pubkey_stat
+- name: Generate ssh key pair there is no pub key 
+  shell: |
+    ssh-keygen -t rsa -b 4096 -f /home/{{agent_user}}/.ssh/id_rsa -N ''
+  become_user: "{{agent_user}}"  
+  when: ssh_pubkey_stat.stat.exists == False
+- name: Slurp pub key from local machine 
+  slurp: 
+    src: "{{ ssh_pubkey_path }}"
+  register: ssh_pubkey
+- name: Create GCP instance
+  google.cloud.gcp_compute_instance:
+    name: "{{ item.name }}"
+    machine_type: "{{ item.machine_type }}"
+    zone: "{{ item.zone }}"
+    project: "{{ gcp_project }}"
+    # auth_kind: application # is used for ADC
+    auth_kind: "serviceaccount"
+    service_account_file: "{{ credential_folder }}/{{ sa_name }}-key.json"
+    state: present # absent -> delete instance 
+    metadata:
+      ssh-keys: "{{agent_user}}:{{ ssh_pubkey['content'] | b64decode }}"
+
+    disks:
+      - auto_delete: true
+        boot: true
+        initialize_params:
+          source_image: "{{ item.image }}"
+          disk_size_gb: "{{ item.disk_size }}"
+          disk_type: "{{ item.disk_type }}"
+    network_interfaces:
+      - network:
+          selfLink: "projects/{{google_project_id}}/global/networks/default"
+        access_configs:
+          - name: External NAT
+            type: ONE_TO_ONE_NAT
+    tags:
+      items:
+        - http-server
+        - https-server
+  loop: "{{ machines_info }}"
+  register: gcp_instances
+  # when: false
+  vars:
+    master_nodes:
+      - master01
+      - master02
+      - master03  
+  when: item.name in master_nodes  # project to create only master instances
+    # - item.name == "master02"
+    # - item.name == "master03"
+  # environment:  # for ADC
+  #   GOOGLE_APPLICATION_CREDENTIALS: "{{ adc_file }}"
+  #   GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES: "1"
+
+# Error in getting the first values  results 
+# ----------------------------------------------------------
+# PHASE 5: Generate inventory.ini
+# ----------------------------------------------------------
+- name: Write gcp_instances into json file
+  copy:
+    content: "{{ gcp_instances }}"
+    dest: "./gcp_more_instances.json" # write to local file next to main playbook because we are not using delegate_to localhost here and machine run on main playbook
+  run_once: true
+  when: true
+- name: Create inventory from template 
+  template: 
+    src: ../templates/masters-inventory.j2
+    dest: ../inventory.ini
+  run_once: true
+  when: true
+
+# ----------------------------------------------------------
+# PHASE 2: Wait for SSH
+# ----------------------------------------------------------
+- name: Wait for SSH to become available
+  ansible.builtin.wait_for:
+    host: "{{ item.networkInterfaces[0].accessConfigs[0].natIP }}"
+    port: 22
+    delay: 10
+    timeout: 120
+    state: started
+  loop: "{{ gcp_instances.results }}"
+  when:
+    - item.name is defined
+    - not (item.skipped | default(false))
+
+# ----------------------------------------------------------
+# PHASE 3: Create DNS Records in Cloudflare
+# ----------------------------------------------------------
+- name: Create Cloudflare DNS A records for each subdomain
+  community.general.cloudflare_dns:
+    zone: "{{ base_domain }}"
+    record: "{{ item.subdomain }}"
+    type: A
+    value: "{{ (gcp_instances.results | selectattr('name', 'equalto', item.machine_name) | first).networkInterfaces[0].accessConfigs[0].natIP }}"
+    ttl: 300
+    proxied: false  # Set to true for Cloudflare CDN/DDoS protection
+    api_token: "{{ cloudflare_api_token }}"
+    state: present
+  loop: "{{ dns_mappings }}"
+  register: cloudflare_dns_results
+
+# ----------------------------------------------------------
+# PHASE 4: Display Summary
+# ----------------------------------------------------------
+- name: "Summary: GCP Instances Created"
+  ansible.builtin.debug:
+    msg: "{{ item.name }} → {{ item.networkInterfaces[0].accessConfigs[0].natIP }}"
+  loop: "{{ gcp_instances.results }}"
+  when:
+    - item.name is defined
+    - not (item.skipped | default(false))
+
+- name: "Summary: DNS Records Created"
+  ansible.builtin.debug:
+    msg: "{{ item.item.subdomain }}.{{ base_domain }} → {{ item.record.content }}"
+  loop: "{{ cloudflare_dns_results.results }}"
+  when: item.record is defined
+
+
+# ----------------------------------------------------------
+# PHASE 5: Final Instructions
+# ----------------------------------------------------------
+- name: "✅ SUCCESS — Infrastructure Ready"
+  ansible.builtin.debug:
+    msg: |
+      
+      ========================================
+      ✅ Infrastructure Created Successfully!
+      ========================================
+      
+      GCP VMs:
+      {% for instance in gcp_instances.results %}
+      {% if instance.name is defined %}
+        - {{ instance.name }}: {{ instance.networkInterfaces[0].accessConfigs[0].natIP }}
+      {% endif %}
+      {% endfor %}
+      
+      DNS Records (Cloudflare):
+      {% for mapping in dns_mappings %}
+        - {{ mapping.subdomain }}.{{ base_domain }}
+      {% endfor %}
+      
+      NEXT STEPS:
+      
+      1. Wait 2-5 minutes for DNS propagation
+          Check with: dig jenkins.{{ base_domain }}
+      
+      2. Run the setup playbook:
+          ansible-playbook -i inventory.ini playbooks/setup_infra.yml
+      
+      3. Access your services:
+          Jenkins:   https://jenkins.{{ base_domain }}
+          SonarQube: https://sonarqube.{{ base_domain }}
+          Nexus:     https://nexus.{{ base_domain }}
+          Docker:    https://docker-repo.{{ base_domain }}
+      
+      ========================================

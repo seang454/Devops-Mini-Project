@@ -1,0 +1,31 @@
+---
+# ============================================================
+# Machine02 Variables — SonarQube Host
+# ============================================================
+
+mode: "master02"
+sonarqube_domain: >-
+  {{
+    (dns_mappings
+     | selectattr('machine_name', 'equalto', mode)
+     | list
+     | first).subdomain
+  }}.{{ base_domain }}
+
+# SonarQube Docker image
+sonarqube_image: "sonarqube:community"
+sonarqube_port: 9000
+
+# SonarQube Docker volumes
+sonarqube_data_volume: "sonarqube-data"
+sonarqube_logs_volume: "sonarqube-logs"
+sonarqube_extensions_volume: "sonarqube-extensions"
+sonarqube_network: "sonarqube_net"
+
+# SonarQube DB (PostgreSQL)
+sonarqube_db_image: "postgres:15"
+sonarqube_db_name: "sonarqube"
+sonarqube_db_user: "sonarqube"
+sonarqube_db_password: "sonarqube_password"  # Change in production!
+sonarqube_db_volume: "sonarqube-postgresql"
+sonarqube_db_data_volume: "sonarqube-postgresql-data"

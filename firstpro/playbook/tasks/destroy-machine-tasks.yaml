@@ -1,0 +1,124 @@
+# =============================================================
+# destroy-machine-tasks.yaml
+# Purpose: Delete GCP instances, clean inventory, remove Cloudflare DNS
+# =============================================================
+
+- name: Loop to show machines to destroy
+  ansible.builtin.debug:
+    msg: "Will destroy: {{ item.name }} in zone {{ item.zone }}"
+  loop: "{{ machines_info }}"
+
+- name: Destroy infrastructure
+  block:
+
+    # ----------------------------------------------------------
+    # PHASE 1: Destroy GCP Instances
+    # ----------------------------------------------------------
+    - name: Delete GCP instances
+      google.cloud.gcp_compute_instance:
+        name: "{{ item.name }}"
+        machine_type: "{{ item.machine_type }}"
+        zone: "{{ item.zone }}"
+        project: "{{ gcp_project }}"
+        auth_kind: "serviceaccount"
+        service_account_file: "{{ credential_folder }}/{{ sa_name }}-key.json"
+        state: absent
+        disks:
+          - auto_delete: true
+            boot: true
+            initialize_params:
+              source_image: "{{ item.image }}"
+              disk_size_gb: "{{ item.disk_size }}"
+              disk_type: "{{ item.disk_type }}"
+        network_interfaces:
+          - network:
+              selfLink: "projects/{{ gcp_project }}/global/networks/default"
+            access_configs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+      loop: "{{ machines_info }}"
+      register: gcp_destroy_results
+      environment:
+        CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "{{ credential_folder }}/{{ sa_name }}-key.json"
+        CLOUDSDK_PYTHON: "{{ venv_path }}/bin/python3"
+
+    - name: Summary — GCP instances destroyed
+      ansible.builtin.debug:
+        msg: "✅ Destroyed: {{ item.item.name }}"
+      loop: "{{ gcp_destroy_results.results }}"
+
+    # ----------------------------------------------------------
+    # PHASE 2: Remove DNS Records from Cloudflare
+    # ----------------------------------------------------------
+    - name: Remove Cloudflare DNS A records for each subdomain
+      community.general.cloudflare_dns:
+        zone: "{{ base_domain }}"
+        record: "{{ item.subdomain }}"
+        type: A
+        api_token: "{{ cloudflare_api_token }}"
+        state: absent
+      loop: "{{ dns_mappings }}"
+      register: cloudflare_delete_results
+      retries: 3
+      delay: 10
+      until: not cloudflare_delete_results.failed
+      ignore_errors: true
+
+    - name: Summary — Cloudflare DNS records removed
+      ansible.builtin.debug:
+        msg: "✅ Removed DNS: {{ item.item.subdomain }}.{{ base_domain }}"
+      loop: "{{ cloudflare_delete_results.results }}"
+      when: not item.failed
+
+  always:
+    # ----------------------------------------------------------
+    # PHASE 3: Always clean inventory.ini — even if phases 1/2 failed
+    # ----------------------------------------------------------
+    - name: Build list of destroyed machine names
+      ansible.builtin.set_fact:
+        destroyed_machine_names: "{{ machines_info | map(attribute='name') | list }}"
+
+    - name: Read existing inventory
+      ansible.builtin.slurp:
+        src: "../../inventory.ini"
+      register: existing_inventory
+      run_once: true
+
+    - name: Initialize surviving machines as empty list
+      ansible.builtin.set_fact:
+        surviving_machines: []
+      run_once: true
+
+    - name: Build surviving machines list
+      ansible.builtin.set_fact:
+        surviving_machines: "{{ surviving_machines | default([]) + [{'name': item[0], 'ip': item[1]}] }}"
+      loop: >-
+        {{
+          existing_inventory.content | b64decode
+          | regex_findall('(?m)^(master\d+)\s+ansible_host=(\S+)')
+        }}
+      when: item[0] not in destroyed_machine_names
+      run_once: true
+
+    - name: Debug surviving machines
+      ansible.builtin.debug:
+        msg: "Surviving machines: {{ surviving_machines }}"
+
+    - name: Render inventory without destroyed machines
+      ansible.builtin.template:
+        src: ../../templates/destroy-inventory.j2
+        dest: ../../inventory.ini
+        mode: "0644"
+      run_once: true
+
+    - name: Summary — destroy complete
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "        DESTROY COMPLETE                   "
+          - "============================================"
+          - "GCP Instances deleted  : {{ destroyed_machine_names | join(', ') }}"
+          - "Cloudflare DNS removed : {{ dns_mappings | map(attribute='subdomain') | map('regex_replace', '$', '.' + base_domain) | list | join(', ') }}"
+          - "Surviving machines     : {{ surviving_machines | map(attribute='name') | list | join(', ') | default('none') }}"
+          - "Inventory updated      : inventory.ini"
+          - "============================================"

@@ -1,0 +1,94 @@
+---
+# =============================================================
+# Global Variables — applies to ALL machines
+# =============================================================
+
+# ---- GCP / IaC settings ----
+google_project_id: "project-8924f831-f818-4bbd-9f9"
+gcp_project: "{{ google_project_id }}"          # alias — tasks reference {{ gcp_project }}
+gcp_auth_kind: "serviceaccount"
+agent_user: "seang"
+
+# FIX: Use literal user 'seang' — ansible_user isn't reliably set when group_vars loads,
+#      so {{ ansible_user }} would resolve to empty or wrong value here.
+venv_path: "/home/seang/venv"
+
+# FIX: Remove ansible_python_interpreter from group_vars entirely.
+#      Setting it here forces ALL hosts (including localhost at Gathering Facts)
+#      to use the venv Python before the venv exists — causing the boot failure.
+#      Instead it is set per-host in inventory.ini where it can be controlled.
+
+ssh_pubkey_path: "/home/seang/.ssh/id_rsa.pub"  # FIX: was ssh_pubkey_path — setup-venv uses {{ ssh_public_path }}
+
+credential_folder: "/home/seang/miniproject/firstpro/credentials"
+gcp_service_account_file: "{{ credential_folder }}/admin-key.json"  # FIX: was a placeholder path
+
+sa_name: "serviceaccount"
+sa_gcp_auth_kind: "application"
+sa_GOOGLE_APPLICATION_CREDENTIALS: "{{ lookup('env', 'HOME') }}/.config/gcloud/application_default_credentials.json"
+sa_display_name: "My Service Account"
+
+# sa_description: "Service account for GCP instance management"
+# ---- Cloudflare DNS settings ----
+# cloudflare_api_token: "{{ lookup('env', 'CLOUDFLARE_API_TOKEN') }}"
+# cloudflare_zone_id:   "{{ lookup('env', 'CLOUDFLARE_ZONE_ID') }}"
+
+# ---- Machine specs ----
+machine_specs:
+  large:
+    machine_type: "e2-standard-2"
+    zone: "asia-northeast3-a"
+    disk_size: 20
+    disk_type: "pd-standard"
+  medium:
+    machine_type: "e2-medium"
+    zone: "asia-northeast3-b"
+    disk_size: 20
+    disk_type: "pd-standard"
+
+ubuntu_specs:
+  v22:
+    image: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+  v24:
+    image: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts"
+
+# ---- Machines to create ----
+machines_info:
+  - name: "master01"
+    machine_type: "{{ machine_specs.large.machine_type }}"
+    image: "{{ ubuntu_specs.v22.image }}"
+    zone: "{{ machine_specs.large.zone }}"
+    disk_size: "{{ machine_specs.large.disk_size }}"
+    disk_type: "{{ machine_specs.large.disk_type }}"
+  - name: "master02"
+    machine_type: "{{ machine_specs.medium.machine_type }}"
+    image: "{{ ubuntu_specs.v22.image }}"
+    zone: "asia-east2-a"
+    disk_size: "{{ machine_specs.medium.disk_size }}"
+    disk_type: "{{ machine_specs.medium.disk_type }}"
+  - name: "master03"
+    machine_type: "{{ machine_specs.medium.machine_type }}"
+    image: "{{ ubuntu_specs.v22.image }}"
+    zone: "asia-east2-a"
+    disk_size: "{{ machine_specs.medium.disk_size }}"
+    disk_type: "{{ machine_specs.medium.disk_type }}"
+
+# ---- Application settings ----
+base_domain: "seang.shop"
+certbot_email: "pengseangsim210@gmail.com"
+portainer_version: "2.21.1"
+ohmyzsh_theme: "robbyrussell"
+admin_user: "{{ agent_user }}"
+
+jenkins_container_name: "myjenkins-blueocean"
+
+dns_mappings:
+  - subdomain: "jenkins-test"
+    machine_name: "{{ machines_info[0].name }}"  # master01
+  - subdomain: "sonarqube-test"
+    machine_name: "{{ machines_info[1].name }}"  # master02
+  - subdomain: "nexus-test"
+    machine_name: "{{ machines_info[2].name }}"  # master03
+  - subdomain: "docker-repo-test"
+    machine_name: "{{ machines_info[2].name }}"  # master03
+

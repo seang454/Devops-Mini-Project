@@ -1,0 +1,32 @@
+# =============================================================
+# inventory.ini.j2 — Jinja2 TEMPLATE
+# This file is rendered by generate_inventory.yml into inventory.ini
+# Do NOT use this file directly as an inventory source.
+# =============================================================
+
+[all:vars]
+ansible_user=seang
+ansible_ssh_private_key_file=/home/seang/.ssh/id_rsa
+# FIX: Use system Python here — venv doesn't exist yet on first run.
+#      setup-venv role creates the venv, then switches interpreter via set_fact.
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_extra_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+[local]
+localhost ansible_connection=local 
+
+[masters]
+{% for instance in gcp_instances.results %}
+{% if instance.name is defined and not (instance.skipped | default(false)) %}
+{{ instance.name }} ansible_host={{ instance.networkInterfaces[0].accessConfigs[0].natIP }}
+{% endif %}
+{% endfor %}
+
+[jenkins_hosts]
+master01
+
+[sonarqube_hosts]
+master02
+
+[nexus_hosts]
+master03

@@ -1,0 +1,347 @@
+---
+# ============================================================
+# Role: nexus
+# Purpose: Deploy Nexus Repository Manager via Docker on Machine03
+#          Set up Docker blob store & Docker hosted repo
+#          Set up Helm blob store & Helm hosted repo
+#          Configure Nginx + HTTPS via Certbot
+# ============================================================
+
+# ---- Nginx & Certbot ----
+- name: Install Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+  become: true
+
+- name: Install Certbot and Nginx plugin
+  ansible.builtin.apt:
+    name:
+      - certbot
+      - python3-certbot-nginx
+    state: present
+  become: true
+
+- name: Ensure Nginx is started and enabled
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true
+  become: true
+
+# ---- Ensure ACME challenge webroot exists ----
+- name: Ensure ACME challenge webroot exists
+  ansible.builtin.file:
+    path: /var/www/html
+    state: directory
+    mode: "0755"
+  become: true
+
+# ---- Clean up old symlinks before recreating ----
+- name: Remove existing Nginx site symlinks to ensure correct links
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/nginx/sites-enabled/nexus
+    - /etc/nginx/sites-enabled/nexus-docker
+  become: true
+
+# ---- Nexus Nginx Virtual Hosts ----
+- name: Deploy Nginx config for Nexus UI
+  ansible.builtin.template:
+    src: nexus_nginx.conf.j2
+    dest: /etc/nginx/sites-available/nexus
+    mode: "0644"
+  become: true
+
+- name: Deploy Nginx config for Nexus Docker Repo
+  ansible.builtin.template:
+    src: nexus_docker_nginx.conf.j2
+    dest: /etc/nginx/sites-available/nexus-docker
+    mode: "0644"
+  become: true
+
+- name: Enable Nexus Nginx sites
+  ansible.builtin.file:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    state: link
+  loop:
+    - { src: /etc/nginx/sites-available/nexus,       dest: /etc/nginx/sites-enabled/nexus }
+    - { src: /etc/nginx/sites-available/nexus-docker, dest: /etc/nginx/sites-enabled/nexus-docker }
+  become: true
+
+- name: Remove default Nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  become: true
+  notify: Reload Nginx
+
+- name: Flush handlers to reload Nginx before starting containers
+  ansible.builtin.meta: flush_handlers
+
+# ---- Docker Network ----
+- name: Create Nexus Docker network
+  community.docker.docker_network:
+    name: "{{ nexus_network }}"
+    state: present
+  become: true
+
+# ---- Nexus volume ----
+- name: Create Nexus data Docker volume
+  community.docker.docker_volume:
+    name: "{{ nexus_data_volume }}"
+    state: present
+  become: true
+
+# ---- Nexus container ----
+- name: Run Nexus Repository Manager container
+  community.docker.docker_container:
+    name: nexus
+    image: "{{ nexus_image }}"
+    state: started
+    restart_policy: unless-stopped
+    networks:
+      - name: "{{ nexus_network }}"
+    volumes:
+      - "{{ nexus_data_volume }}:/nexus-data"
+    ports:
+      - "{{ nexus_port }}:8081"
+      - "{{ nexus_docker_port }}:8082"
+    ulimits:
+      - nofile:65536:65536
+  become: true
+
+# ---- Wait for Nexus to be ready ----
+- name: Wait for Nexus to become available (can take 2-3 minutes)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/status"
+    method: GET
+    status_code: 200
+  register: nexus_status
+  retries: 40
+  delay: 15
+  until: nexus_status.status == 200
+
+# ---- Certbot SSL (runs AFTER Nexus is ready — no more 502) ----
+- name: Check if SSL certificate already exists for Nexus UI
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ nexus_domain }}/fullchain.pem"
+  register: cert_status_nexus
+
+- name: Obtain Let's Encrypt certificate for Nexus UI
+  ansible.builtin.command:
+    cmd: >
+      certbot --nginx
+      -d {{ nexus_domain }}
+      --non-interactive
+      --agree-tos
+      --email {{ certbot_email }}
+      --redirect
+  become: true
+  register: certbot_nexus_result
+  changed_when: "'Certificate not yet due for renewal' not in certbot_nexus_result.stdout"
+  failed_when:
+    - certbot_nexus_result.rc != 0
+    - "'Certificate not yet due for renewal' not in certbot_nexus_result.stdout"
+  when: not cert_status_nexus.stat.exists
+
+- name: Check if SSL certificate already exists for Docker repo domain
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ nexus_docker_repo_domain }}/fullchain.pem"
+  register: cert_status_docker
+
+- name: Obtain Let's Encrypt certificate for Docker repo domain
+  ansible.builtin.command:
+    cmd: >
+      certbot --nginx
+      -d {{ nexus_docker_repo_domain }}
+      --non-interactive
+      --agree-tos
+      --email {{ certbot_email }}
+      --redirect
+  become: true
+  register: certbot_docker_repo_result
+  changed_when: "'Certificate not yet due for renewal' not in certbot_docker_repo_result.stdout"
+  failed_when:
+    - certbot_docker_repo_result.rc != 0
+    - "'Certificate not yet due for renewal' not in certbot_docker_repo_result.stdout"
+  when: not cert_status_docker.stat.exists
+
+# ---- Retrieve initial Nexus admin password ----
+- name: Get initial Nexus admin password from container
+  ansible.builtin.command:
+    cmd: docker exec nexus cat /nexus-data/admin.password
+  become: true
+  register: nexus_admin_password
+  changed_when: false
+  ignore_errors: true
+
+- name: Show initial Nexus admin password
+  ansible.builtin.debug:
+    msg: >
+      Initial Nexus admin password: {{ nexus_admin_password.stdout | default('N/A — may have been changed already') }}
+      PLEASE SAVE THIS AND CHANGE IT IMMEDIATELY.
+
+# ---- Check existing blob stores and repos ----
+- name: Check existing blob stores
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/blobstores"
+    method: GET
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    return_content: true
+  register: existing_blobstores
+
+- name: Check existing repositories
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/repositories"
+    method: GET
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    return_content: true
+  register: existing_repos
+
+# ---- Docker blob store ----
+- name: Create Docker blob store
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/blobstores/file"
+    method: POST
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_docker_blob }}"
+      path: "{{ nexus_docker_blob }}"
+    status_code: [200, 201, 204]
+  when: nexus_docker_blob not in (existing_blobstores.json | map(attribute='name') | list)
+
+- name: Update Docker blob store
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/blobstores/file/{{ nexus_docker_blob }}"
+    method: PUT
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_docker_blob }}"
+      path: "{{ nexus_docker_blob }}"
+    status_code: [200, 201, 204]
+  when: nexus_docker_blob in (existing_blobstores.json | map(attribute='name') | list)
+
+# ---- Helm blob store ----
+- name: Create Helm blob store
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/blobstores/file"
+    method: POST
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_helm_blob }}"
+      path: "{{ nexus_helm_blob }}"
+    status_code: [200, 201, 204]
+  when: nexus_helm_blob not in (existing_blobstores.json | map(attribute='name') | list)
+
+- name: Update Helm blob store
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/blobstores/file/{{ nexus_helm_blob }}"
+    method: PUT
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_helm_blob }}"
+      path: "{{ nexus_helm_blob }}"
+    status_code: [200, 201, 204]
+  when: nexus_helm_blob in (existing_blobstores.json | map(attribute='name') | list)
+
+# ---- Docker hosted repository ----
+- name: Create Docker hosted repository
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/repositories/docker/hosted"
+    method: POST
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_docker_repo_name }}"
+      online: true
+      storage:
+        blobStoreName: "{{ nexus_docker_blob }}"
+        strictContentTypeValidation: true
+        writePolicy: ALLOW
+      docker:
+        v1Enabled: false
+        forceBasicAuth: true
+        httpPort: 8082
+    status_code: [200, 201, 204]
+  when: nexus_docker_repo_name not in (existing_repos.json | map(attribute='name') | list)
+
+- name: Update Docker hosted repository
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/repositories/docker/hosted/{{ nexus_docker_repo_name }}"
+    method: PUT
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_docker_repo_name }}"
+      online: true
+      storage:
+        blobStoreName: "{{ nexus_docker_blob }}"
+        strictContentTypeValidation: true
+        writePolicy: ALLOW
+      docker:
+        v1Enabled: false
+        forceBasicAuth: true
+        httpPort: 8082
+    status_code: [200, 201, 204]
+  when: nexus_docker_repo_name in (existing_repos.json | map(attribute='name') | list)
+
+# ---- Helm hosted repository ----
+- name: Create Helm hosted repository
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/repositories/helm/hosted"
+    method: POST
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_helm_repo_name }}"
+      online: true
+      storage:
+        blobStoreName: "{{ nexus_helm_blob }}"
+        strictContentTypeValidation: true
+        writePolicy: ALLOW
+    status_code: [200, 201, 204]
+  when: nexus_helm_repo_name not in (existing_repos.json | map(attribute='name') | list)
+
+- name: Update Helm hosted repository
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ nexus_port }}/service/rest/v1/repositories/helm/hosted/{{ nexus_helm_repo_name }}"
+    method: PUT
+    user: admin
+    password: "{{ nexus_admin_password.stdout }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ nexus_helm_repo_name }}"
+      online: true
+      storage:
+        blobStoreName: "{{ nexus_helm_blob }}"
+        strictContentTypeValidation: true
+        writePolicy: ALLOW
+    status_code: [200, 201, 204]
+  when: nexus_helm_repo_name in (existing_repos.json | map(attribute='name') | list)

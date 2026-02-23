@@ -1,0 +1,33 @@
+---
+# ============================================================
+# Machine03 Variables — Nexus Repository Host
+# ============================================================
+
+mode: "master03"
+# Helper variable — safely selects the mapping for master03
+nexus_mapping: >-
+  {{
+    (dns_mappings
+     | selectattr('machine_name', 'equalto', mode)
+     | list
+  }}
+
+# Domains
+nexus_domain: "{{ dns_mappings[2].subdomain }}.{{ base_domain }}"
+nexus_docker_repo_domain: "{{ dns_mappings[3].subdomain }}.{{ base_domain }}"
+# nexus_helm_repo_domain: "{{ nexus_mapping[2].subdomain }}.{{ base_domain }}"
+
+# Nexus Docker image
+nexus_image: "sonatype/nexus3:latest"
+nexus_port: 8081
+nexus_docker_port: 8082  # Docker hosted repo port
+nexus_network: "nexus_net"
+
+# Nexus Docker volumes
+nexus_data_volume: "nexus-data"
+
+# Nexus repository names
+nexus_docker_blob: "docker-blob"
+nexus_helm_blob: "helm-blob"
+nexus_docker_repo_name: "docker-hosted"
+nexus_helm_repo_name: "helm-hosted"

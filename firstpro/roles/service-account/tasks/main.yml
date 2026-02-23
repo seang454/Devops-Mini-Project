@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: MIT-0
+# tasks file for roles/service-account
+
+- name: Ensure credential directory exists
+  file:
+    path: "{{ credential_folder }}"
+    state: directory
+    mode: '0755'
+
+- name: Check if service account already exists
+  command: >
+    gcloud iam service-accounts describe
+    {{ sa_name }}@{{ gcp_project }}.iam.gserviceaccount.com
+  environment:
+    CLOUDSDK_PYTHON: "{{ venv_path }}/bin/python"
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "{{ sa_GOOGLE_APPLICATION_CREDENTIALS }}"
+    # Note: Using CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE ensures gcloud uses the correct service account credentials from the venv environment, even if GOOGLE_APPLICATION_CREDENTIALS is set globally for ADC. 
+    # This avoids conflicts and ensures the right permissions are applied to the service account.
+    # If we used GOOGLE_APPLICATION_CREDENTIALS here, it might point to a different credential file (like the ADC file) which may not have the necessary permissions to assign roles to the new service account. 
+    # By using CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE, we ensure that gcloud uses the credentials of the service account we just created for this role assignment step.
+  register: sa_exists
+  failed_when: false
+  changed_when: false
+
+- name: Create service account
+  google.cloud.gcp_iam_service_account:
+    name: "{{ sa_name }}"
+    display_name: "{{ sa_display_name }}"
+    project: "{{ gcp_project }}"
+    auth_kind: "{{ sa_gcp_auth_kind }}"
+    state: present
+  environment:
+    GOOGLE_APPLICATION_CREDENTIALS: "{{ sa_GOOGLE_APPLICATION_CREDENTIALS }}"
+  when: sa_exists.rc != 0
+
+- name: Set service account email fact
+  set_fact:
+    sa_email: "{{ sa_name }}@{{ gcp_project }}.iam.gserviceaccount.com"
+
+- name: Display service account email
+  debug:
+    msg: "Service account email: {{ sa_email }}"
+
+- name: Assign Compute Instance Admin role to service account
+  command: >
+    gcloud projects add-iam-policy-binding {{ gcp_project }}
+    --member="serviceAccount:{{ sa_email }}"
+    --role="roles/compute.instanceAdmin.v1"
+  environment:
+    CLOUDSDK_PYTHON: "{{ venv_path }}/bin/python"
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "{{ sa_GOOGLE_APPLICATION_CREDENTIALS }}"
+  changed_when: true
+
+- name: Assign Service Account User role
+  command: >
+    gcloud projects add-iam-policy-binding {{ gcp_project }}
+    --member="serviceAccount:{{ sa_email }}"
+    --role="roles/iam.serviceAccountUser"
+  environment:
+    CLOUDSDK_PYTHON: "{{ venv_path }}/bin/python"
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "{{ sa_GOOGLE_APPLICATION_CREDENTIALS }}"
+  changed_when: true
+
+- name: Check if service account key file already exists locally
+  stat:
+    path: "{{ credential_folder }}/{{ sa_name }}-key.json"
+  register: key_file
+
+# SA already exists AND key file already exists locally — nothing to do
+- name: Skip key creation message
+  debug:
+    msg: "Service account and key already exist locally, skipping key creation."
+  when: sa_exists.rc == 0 and key_file.stat.exists
+
+# SA already exists but NO local key — list existing keys and download the first one
+- name: List existing service account keys
+  command: >
+    gcloud iam service-accounts keys list
+    --iam-account={{ sa_email }}
+    --managed-by=user
+    --format="value(name)"
+  environment:
+    CLOUDSDK_PYTHON: "{{ venv_path }}/bin/python"
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "{{ sa_GOOGLE_APPLICATION_CREDENTIALS }}"
+  register: existing_keys
+  when: sa_exists.rc == 0 and not key_file.stat.exists
+  changed_when: false
+
+# NOTE: GCP does not allow downloading existing key material after creation.
+# If SA exists but no local key found, we must create a new key.
+- name: Create new key for existing service account (existing key material unrecoverable)
+  command: >
+    gcloud iam service-accounts keys create {{ credential_folder }}/{{ sa_name }}-key.json
+    --iam-account={{ sa_email }}
+  environment:
+    CLOUDSDK_PYTHON: "{{ venv_path }}/bin/python"
+    CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE: "{{ sa_GOOGLE_APPLICATION_CREDENTIALS }}"
+  when: sa_exists.rc == 0 and not key_file.stat.exists
+  changed_when: true
+
+# SA is new — create a fresh key
+- name: Create service account key for new service account
+  google.cloud.gcp_iam_service_account_key:
+    service_account:
+      name: "projects/{{ gcp_project }}/serviceAccounts/{{ sa_email }}"
+    project: "{{ gcp_project }}"
+    auth_kind: "{{ sa_gcp_auth_kind }}"
+    key_algorithm: "KEY_ALG_RSA_2048"
+    private_key_type: "TYPE_GOOGLE_CREDENTIALS_FILE"
+    state: present
+  environment:
+    GOOGLE_APPLICATION_CREDENTIALS: "{{ sa_GOOGLE_APPLICATION_CREDENTIALS }}"
+  register: sa_key
+  when: sa_exists.rc != 0 and not key_file.stat.exists
+
+- name: Save new service account key to credential folder
+  copy:
+    content: "{{ sa_key.private_key_data | b64decode }}"
+    dest: "{{ credential_folder }}/{{ sa_name }}-key.json"
+    mode: '0600'
+  when: sa_exists.rc != 0 and not key_file.stat.exists
+
+- name: Display success message
+  debug:
+    msg:
+      - "Service account ready!"
+      - "Email: {{ sa_email }}"
+      - "Key file location: {{ credential_folder }}/{{ sa_name }}-key.json"
+      - "Use this key file for future Ansible runs with auth_kind: serviceaccount"

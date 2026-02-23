@@ -1,0 +1,75 @@
+#SPDX-License-Identifier: MIT-0
+# tasks file for roles/setup-venv
+---
+# =============================================================
+# setup-pipx-inject.yaml
+# Purpose: Inject google-auth into Ansible pipx venv if not already installed
+# =============================================================
+
+- name: Check if google-auth is already installed in Ansible pipx venv
+  ansible.builtin.command:
+    cmd: /home/{{ agent_user }}/.local/share/pipx/venvs/ansible/bin/python -c "import google.auth"
+  register: google_auth_check
+  changed_when: false
+  failed_when: false
+
+- name: Install google-auth directly into Ansible pipx venv using pip
+  ansible.builtin.command:
+    cmd: >
+      /home/{{ agent_user }}/.local/share/pipx/venvs/ansible/bin/python -m pip install
+      google-auth requests google-api-python-client google-auth-httplib2
+  when: google_auth_check.rc != 0
+  changed_when: true
+
+- name: Verify google-auth is now available
+  ansible.builtin.command:
+    cmd: /home/{{ agent_user }}/.local/share/pipx/venvs/ansible/bin/python -c "import google.auth; print('ok')"
+  register: verify_result
+  changed_when: false
+
+- name: Show result
+  ansible.builtin.debug:
+    msg: "{{ 'google-auth already installed — skipped' if google_auth_check.rc == 0 else 'google-auth injected: ' + verify_result.stdout }}"
+
+# this for setting up the Python virtual environment on the control machine (localhost) for gcloud interactions
+- name: Update apt cache
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  become: true
+
+- name: Install system packages for Python venv
+  apt:
+    name:
+      - python3-venv
+      - python3-pip
+    state: present
+
+# venv_path is a variable that defines where the Python virtual environment will be created.
+- name: Create Python virtual environment
+  command: python3 -m venv {{ venv_path }}
+  args:
+    creates: "{{ venv_path }}"
+
+- name: Upgrade pip in virtual environment
+  pip:
+    name: pip
+    state: latest
+    virtualenv: "{{ venv_path }}"
+
+- name: Install required Python packages in virtual environment
+  pip:
+    name:
+      - requests
+      - google-auth
+      - google-api-python-client
+      - requests-oauthlib
+      - google-auth-httplib2
+    state: present
+    virtualenv: "{{ venv_path }}"
+
+# FIX: After venv is created, switch ansible_python_interpreter to use it
+#      for all subsequent tasks in this play. This must come AFTER venv creation.
+- name: Switch to venv Python interpreter for remainder of play
+  set_fact:
+    ansible_python_interpreter: "{{ venv_path }}/bin/python"

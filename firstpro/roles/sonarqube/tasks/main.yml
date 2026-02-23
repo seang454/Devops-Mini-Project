@@ -1,0 +1,178 @@
+---
+# ============================================================
+# Role: sonarqube
+# Purpose: Deploy SonarQube via Docker on Machine02
+#          Configure Nginx + HTTPS via Certbot
+# ============================================================
+
+# ---- System tuning (required by SonarQube) ----
+- name: Set vm.max_map_count for Elasticsearch (SonarQube requirement)
+  ansible.posix.sysctl:
+    name: vm.max_map_count
+    value: "524288"
+    state: present
+    reload: true
+  become: true
+
+- name: Set fs.file-max for SonarQube
+  ansible.posix.sysctl:
+    name: fs.file-max
+    value: "131072"
+    state: present
+    reload: true
+  become: true
+
+# ---- Nginx & Certbot ----
+- name: Install Nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+  become: true
+
+- name: Install Certbot and Nginx plugin
+  ansible.builtin.apt:
+    name:
+      - certbot
+      - python3-certbot-nginx
+    state: present
+  become: true
+
+- name: Ensure Nginx is started and enabled
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true
+  become: true
+
+# ---- SonarQube Nginx Virtual Host ----
+- name: Deploy Nginx config for SonarQube
+  ansible.builtin.template:
+    src: sonarqube_nginx.conf.j2
+    dest: /etc/nginx/sites-available/sonarqube
+    mode: "0644"
+  become: true
+  notify: Reload Nginx
+
+- name: Enable SonarQube Nginx site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/sonarqube
+    dest: /etc/nginx/sites-enabled/sonarqube
+    state: link
+  become: true
+  notify: Reload Nginx
+
+- name: Remove default Nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  become: true
+  notify: Reload Nginx
+
+- name: Check if SSL certificate already exists
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ sonarqube_domain }}/fullchain.pem"
+  register: cert_status
+
+# ---- Certbot SSL ----
+- name: Obtain Let's Encrypt certificate for SonarQube
+  ansible.builtin.command:
+    cmd: >
+      certbot --nginx
+      -d {{ sonarqube_domain }}
+      --non-interactive
+      --agree-tos
+      --email {{ certbot_email }}
+      --redirect
+  become: true
+  register: certbot_sonar_result
+  changed_when: "'Certificate not yet due for renewal' not in certbot_sonar_result.stdout"
+  when: not cert_status.stat.exists
+
+# ---- Docker Network ----
+- name: Create SonarQube Docker network
+  community.docker.docker_network:
+    name: "{{ sonarqube_network }}"
+    state: present
+  become: true
+
+# ---- PostgreSQL for SonarQube ----
+- name: Run PostgreSQL container for SonarQube
+  community.docker.docker_container:
+    name: sonarqube-db
+    image: "{{ sonarqube_db_image }}"
+    state: started
+    restart_policy: unless-stopped
+    networks:
+      - name: "{{ sonarqube_network }}"
+    env:
+      POSTGRES_DB: "{{ sonarqube_db_name }}"
+      POSTGRES_USER: "{{ sonarqube_db_user }}"
+      POSTGRES_PASSWORD: "{{ sonarqube_db_password }}"
+    volumes:
+      - "{{ sonarqube_db_volume }}:/var/lib/postgresql"
+      - "{{ sonarqube_db_data_volume }}:/var/lib/postgresql/data"
+  become: true
+
+# ---- SonarQube container ----
+- name: Run SonarQube container
+  community.docker.docker_container:
+    name: sonarqube
+    image: "{{ sonarqube_image }}"
+    state: started
+    restart_policy: unless-stopped
+    networks:
+      - name: "{{ sonarqube_network }}"
+    env:
+      SONAR_JDBC_URL: "jdbc:postgresql://sonarqube-db:5432/{{ sonarqube_db_name }}"
+      SONAR_JDBC_USERNAME: "{{ sonarqube_db_user }}"
+      SONAR_JDBC_PASSWORD: "{{ sonarqube_db_password }}"
+    volumes:
+      - "{{ sonarqube_data_volume }}:/opt/sonarqube/data"
+      - "{{ sonarqube_logs_volume }}:/opt/sonarqube/logs"
+      - "{{ sonarqube_extensions_volume }}:/opt/sonarqube/extensions"
+    ports:
+      - "{{ sonarqube_port }}:9000"
+    ulimits:
+      - nofile:65536:65536
+  become: true
+
+# ---- Wait for SonarQube ----
+- name: Wait for SonarQube to be ready
+  ansible.builtin.uri:
+    url: "http://localhost:{{ sonarqube_port }}/api/system/status"
+    return_content: true
+    status_code: 200
+  register: sonar_status
+  until: >
+    sonar_status.status == 200 and
+    sonar_status.json is defined and
+    sonar_status.json.status == "UP"
+  retries: 40
+  delay: 10
+  failed_when: false
+
+- name: Check if default admin password is still active
+  ansible.builtin.uri:
+    url: "http://localhost:{{ sonarqube_port }}/api/authentication/validate"
+    method: GET
+    user: admin
+    password: admin
+    force_basic_auth: true
+  register: default_auth_check
+  failed_when: false
+
+- name: Change default admin password
+  ansible.builtin.uri:
+    url: "http://localhost:{{ sonarqube_port }}/api/users/change_password"
+    method: POST
+    user: admin
+    password: admin
+    force_basic_auth: true
+    body_format: form-urlencoded
+    body:
+      login: admin
+      previousPassword: admin
+      password: "{{ sonarqube_admin_password }}"
+    status_code: 204
+  when: default_auth_check.status == 200
+  failed_when: false

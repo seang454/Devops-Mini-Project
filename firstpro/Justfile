@@ -1,0 +1,9 @@
+setup-iac:
+    # echo "Please login gcloud CLI first if you haven't done so..."
+    # gcloud auth login 
+    # gcloud auth application-default login 
+    echo "Setup Infrastructure......"
+    ansible-playbook -i inventory.ini playbook/main-iac.yaml --ask-become-pass
+destroy: 
+    echo "Destroy the whole infrastructure..."
+    ansible-playbook -i inventory.ini playbook/main-destroy.yaml --ask-become-pass 

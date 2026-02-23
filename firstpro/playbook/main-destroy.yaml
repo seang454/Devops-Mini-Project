@@ -1,0 +1,10 @@
+- name: delete machine gcp_instances
+  hosts: localhost
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+    - ../group_vars/secrets.yml
+  tasks:
+    - name: Run setup-gcloud-env task
+      import_tasks: ./tasks/setup-env.yaml
+    - import_tasks: ./tasks/destroy-machine-tasks.yaml
